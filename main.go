@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
 	"github.com/ollama/ollama/api"
 	"github.com/spf13/cobra"
+	// progressbar
+	"github.com/schollz/progressbar/v3"
 )
 
 const (
@@ -18,7 +21,7 @@ const (
 	RoleDefender   = "defender"
 	RoleSummarizer = "summarizer"
 
-	MaxHistory = 10 // max number of previous messages to keep
+	MaxHistory = 100 // max number of previous messages to keep
 )
 
 type Message struct {
@@ -47,13 +50,13 @@ type LLMConfig struct {
 
 // Interface for LLM client to allow mocking
 type LLMClient interface {
-	Generate(ctx context.Context, model, prompt string) (string, error)
+	Generate(ctx context.Context, model, system, prompt string) (string, error)
 }
 
 // ---------------- Main -----------------
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -80,7 +83,7 @@ func addFlags(cmd *cobra.Command) {
 }
 
 // ---------------- CLI -----------------
-func runCLI(cmd *cobra.Command, args []string) error {
+func runCLI(cmd *cobra.Command, _ []string) error {
 	config, llm, err := parseFlags(cmd)
 	if err != nil {
 		return err
@@ -109,7 +112,8 @@ func runCLI(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if config.Rounds <= 0 {
-		config.Rounds = 3
+		// infinity rounds
+		config.Rounds = math.MaxInt
 	}
 
 	debate, err := runDebateFlow(llmClient, input, config, llm)
@@ -134,44 +138,111 @@ func NewOllamaClient(client *api.Client) *OllamaClient {
 	return &OllamaClient{Client: client}
 }
 
-func (o *OllamaClient) Generate(ctx context.Context, model, prompt string) (string, error) {
+func (o *OllamaClient) GenerateWithChannel(ctx context.Context, model, system, prompt string, channel chan<- int) (string, error) {
 	var result string
+
+	resultCount := 0
+	stream := true
+
 	err := o.Client.Generate(ctx, &api.GenerateRequest{
 		Model:  model,
+		System: system,
 		Prompt: prompt,
+		Stream: &stream,
+		Options: map[string]any{
+			"temperature": 0.7,
+			"top_p":       0.9,
+			"max_tokens":  150,
+		},
 	}, func(resp api.GenerateResponse) error {
 		result += resp.Response
+		channel <- resultCount
+		resultCount++
 		return nil
 	})
 	if err != nil {
+		close(channel)
 		return "", err
 	}
 	if result == "" {
+		close(channel)
 		return "", errors.New("empty response")
 	}
+
+	close(channel)
 	return result, nil
+}
+
+func (o *OllamaClient) Generate(ctx context.Context, model, system, prompt string) (string, error) {
+	channel := make(chan int)
+	progress := progressbar.Default(-1)
+	go func() {
+		for range channel {
+			err := progress.Add(1)
+			if err != nil {
+				err = fmt.Errorf("adding progress bar: %w", err)
+				panic(err)
+			}
+		}
+		err := progress.Finish()
+		if err != nil {
+			err = fmt.Errorf("finishing progress bar: %w", err)
+			panic(err)
+		}
+	}()
+	return o.GenerateWithChannel(ctx, model, system, prompt, channel)
+}
+
+func logDebate(format string, a ...any) (int, error) {
+	return fmt.Printf("\n Logged on: "+time.Now().String()+"\n"+format+"\n", a...)
 }
 
 // ---------------- Debate -----------------
 func runDebateFlow(client LLMClient, claim string, config DebateConfig, llm LLMConfig) ([]DebateRound, error) {
 	var rounds []DebateRound
-	history := []Message{{Role: RoleUser, Content: claim}}
+	claimEntry := Message{Role: RoleUser, Content: claim}
+	history := []Message{claimEntry}
+
+	_, err := logDebate("Starting debate with claim: %s\n", claim)
+	if err != nil {
+		return nil, err
+	}
 
 	for i := 0; i < config.Rounds; i++ {
-		history = trimHistory(history, MaxHistory)
+		tempHistory := trimHistory(history, MaxHistory+1)
+		tempHistory[0] = claimEntry
 
-		chal, err := runSingleRound(client, llm.ChallengerModel, llm.ChalPrompt, history, RoleChallenger)
+		var localHistory []Message
+
+		chal, err := runSingleRound(client, llm.ChallengerModel, RoleChallenger+"\n"+llm.ChalPrompt, tempHistory)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("running challenger: %w", err)
 		}
-		history = append(history, Message{Role: RoleChallenger, Content: chal})
+		chalEntry := Message{Role: RoleChallenger, Content: chal}
 
-		def, err := runSingleRound(client, llm.DefenderModel, llm.DefPrompt, history, RoleDefender)
+		tempHistory = append(tempHistory, chalEntry)
+		localHistory = append(localHistory, chalEntry)
+
+		_, err = logDebate("Challenger responded: %s", chal)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("logging challenger response: %w", err)
 		}
-		history = append(history, Message{Role: RoleDefender, Content: def})
 
+		def, err := runSingleRound(client, llm.DefenderModel, RoleDefender+"\n"+llm.DefPrompt, tempHistory)
+		if err != nil {
+			return nil, fmt.Errorf("running defender: %w", err)
+		}
+		defEntry := Message{Role: RoleDefender, Content: def}
+
+		tempHistory = append(tempHistory, defEntry)
+		localHistory = append(localHistory, defEntry)
+
+		_, err = logDebate("Defender responded: %s", def)
+		if err != nil {
+			return nil, fmt.Errorf("logging defender response: %w", err)
+		}
+
+		history = append(history, localHistory...)
 		rounds = append(rounds, DebateRound{Challenger: chal, Defender: def})
 	}
 	return rounds, nil
@@ -184,12 +255,13 @@ func trimHistory(history []Message, max int) []Message {
 	return history[len(history)-max:]
 }
 
-func runSingleRound(client LLMClient, model, prompt string, history []Message, role string) (string, error) {
-	fullPrompt := prompt + "\n"
+func runSingleRound(client LLMClient, model, prompt string, history []Message) (string, error) {
+	fullPrompt := ""
 	for _, m := range history {
 		fullPrompt += fmt.Sprintf("%s: %s\n", m.Role, m.Content)
 	}
-	return client.Generate(context.Background(), model, fullPrompt)
+
+	return client.Generate(context.Background(), model, prompt, fullPrompt)
 }
 
 // ---------------- Summarize -----------------
@@ -198,7 +270,7 @@ func summarizeDebate(client LLMClient, debate []DebateRound, model string) (stri
 	for i, r := range debate {
 		fullText += fmt.Sprintf("### Round %d\nChallenger: %s\nDefender: %s\n\n", i+1, r.Challenger, r.Defender)
 	}
-	return runSingleRound(client, model, "Summarize the debate: top blind spots, opportunities, deadly assumption.", []Message{{Role: RoleSystem, Content: fullText}}, RoleSummarizer)
+	return runSingleRound(client, model, "Summarize the debate: top blind spots, opportunities, deadly assumption.", []Message{{Role: RoleSystem, Content: fullText}})
 }
 
 // ---------------- Utils -----------------
@@ -231,7 +303,7 @@ func mustLoadPrompt(path, fallback string) string {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️ Warning: failed to load prompt %s, using default\n", path)
+		_, _ = fmt.Fprintf(os.Stderr, "⚠️ Warning: failed to load prompt %s, using default\n", path)
 		return fallback
 	}
 	return string(data)
@@ -252,6 +324,9 @@ func estimateRounds(client LLMClient, claim string, llm LLMConfig, duration stri
 		return 0, err
 	}
 	elapsed := time.Since(start)
+	if elapsed <= 0 {
+		elapsed = time.Millisecond
+	}
 	total, err := time.ParseDuration(duration)
 	if err != nil {
 		return 0, fmt.Errorf("invalid duration: %w", err)
