@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"os"
 	"time"
 
@@ -15,13 +16,14 @@ import (
 )
 
 const (
+	DefaultModel = "llama3.1"
+
 	RoleUser       = "user"
 	RoleSystem     = "system"
 	RoleChallenger = "challenger"
 	RoleDefender   = "defender"
-	RoleSummarizer = "summarizer"
 
-	MaxHistory = 100 // max number of previous messages to keep
+	MaxHistory = math.MaxInt - 1e3 // max number of previous messages to keep
 )
 
 type Message struct {
@@ -76,8 +78,8 @@ func addFlags(cmd *cobra.Command) {
 	cmd.Flags().String("output", "", "Path to output report")
 	cmd.Flags().Int("rounds", 0, "Number of debate rounds")
 	cmd.Flags().String("duration", "", "Total duration (e.g., 1h)")
-	cmd.Flags().String("challenger", "llama3", "Challenger model")
-	cmd.Flags().String("defender", "llama3", "Defender model")
+	cmd.Flags().String("challenger", DefaultModel, "Challenger model")
+	cmd.Flags().String("defender", DefaultModel, "Defender model")
 	cmd.Flags().String("challenger-prompt", "", "Challenger prompt or file")
 	cmd.Flags().String("defender-prompt", "", "Defender prompt or file")
 }
@@ -150,9 +152,26 @@ func (o *OllamaClient) GenerateWithChannel(ctx context.Context, model, system, p
 		Prompt: prompt,
 		Stream: &stream,
 		Options: map[string]any{
-			"temperature": 0.7,
-			"top_p":       0.9,
-			"max_tokens":  150,
+			// Core randomness / creativity
+			"temperature": rand.Float64(), // higher = more creative/aggressive
+			"top_p":       0.95,           // higher = more diverse
+			"top_k":       50,             // slightly higher for variety
+
+			// Repetition control
+			"repeat_last_n":  128, // how far back to look to prevent repeats
+			"repeat_penalty": 1.2, // stronger penalty for repeated tokens
+
+			// Mirostat sampling (controls for more "focused but bold" text)
+			"mirostat":     1,   // enable Mirostat
+			"mirostat_eta": 0.1, // learning rate
+			"mirostat_tau": 5.0, // balance coherence/diversity
+
+			// Context and prediction limits
+			"num_ctx":     16000, // context window size
+			"num_predict": 100,   // how many tokens to generate
+			"min_p":       0.05,  // optional, filter very low-prob tokens
+			"tfs_z":       1.0,   // tail-free sampling
+			"seed":        time.Now().UnixNano(),
 		},
 	}, func(resp api.GenerateResponse) error {
 		result += resp.Response
@@ -209,8 +228,8 @@ func runDebateFlow(client LLMClient, claim string, config DebateConfig, llm LLMC
 	}
 
 	for i := 0; i < config.Rounds; i++ {
-		tempHistory := trimHistory(history, MaxHistory+1)
-		tempHistory[0] = claimEntry
+		tempHistory := trimHistory(history, MaxHistory)
+		tempHistory = append([]Message{claimEntry}, tempHistory...)
 
 		var localHistory []Message
 
@@ -260,6 +279,9 @@ func runSingleRound(client LLMClient, model, prompt string, history []Message) (
 	for _, m := range history {
 		fullPrompt += fmt.Sprintf("%s: %s\n", m.Role, m.Content)
 	}
+
+	systemInstruction := "Do not prepend your responses with your role (e.g., do not start with 'Assistant:'). Respond only within your responsibility."
+	fullPrompt += fmt.Sprintf("\n%s\n", systemInstruction)
 
 	return client.Generate(context.Background(), model, prompt, fullPrompt)
 }
